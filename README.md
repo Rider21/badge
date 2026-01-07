@@ -38,7 +38,7 @@ assets/
 
 ## Performance
 
-- Renders at 320px resolution
+- Renders at 300px resolution
 - Uses object pooling to reduce GC pressure
 - Skips existing files to avoid redundant work
 - Progress tracking every 100 renders
