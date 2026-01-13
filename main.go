@@ -29,20 +29,20 @@ const (
 	OutputSize = 300
 )
 
-// Data structures
 type BadgeColorData struct{ R, G, B int }
+
 type BadgeIconData struct {
-	Layer           int
-	OriginalIcon    *image.RGBA
-	OriginalOutline *image.RGBA
+	Layer         int
+	ScaledIcon    *image.Alpha
+	ScaledOutline *image.Alpha
 }
 
 type RenderJob struct {
 	Filename string
 	Palette  color.Palette
-	Symbol   *image.RGBA
-	Border   *image.RGBA
-	Outline  *image.RGBA
+	Symbol   *image.Alpha
+	Border   *image.Alpha
+	Outline  *image.Alpha
 }
 
 var (
@@ -51,12 +51,11 @@ var (
 	layer0ColorIndices []int
 	layer1ColorIndices []int
 
-	// Single pool for all RGBA buffers (used for dst and scratch)
 	rgbaPool    sync.Pool
 	palettePool sync.Pool
 
 	fileCaseMap   map[string]string
-	existingFiles map[string]bool // Cache of existing files
+	existingFiles map[string]bool
 )
 
 func init() {
@@ -80,14 +79,12 @@ func main() {
 		log.Fatalf("Critical error: %v", err)
 	}
 
-	// Single-run mode
 	if len(os.Args) > 1 {
 		runSingleMode(os.Args[1])
 		return
 	}
 
-	_ = os.MkdirAll(OutputPath, 0755)
-
+	os.MkdirAll(OutputPath, 0755)
 	scanOutputDirectory()
 
 	total := calculateTotal()
@@ -113,22 +110,14 @@ func main() {
 		})
 	}
 
-	// Job generator
 	go func() {
 		for _, c1Idx := range layer0ColorIndices {
 			c1 := getColor(c1Idx)
-
 			for _, c2Idx := range layer1ColorIndices {
 				c2 := getColor(c2Idx)
 
-				// Create a shared palette once for this combination of colors
-				sharedPalette := color.Palette{
-					color.RGBA{0, 0, 0, 0}, // [0] Transparent
-					c1,                     // [1] Color for Symbol/Outline
-					c2,                     // [2] Color for Border Base
-				}
+				smartPalette := createSmartPalette(c1, c2)
 
-				// Iterate over icons
 				for sIdx, symbol := range badgeIcons {
 					if symbol.Layer != 0 {
 						continue
@@ -138,8 +127,6 @@ func main() {
 							continue
 						}
 						fName := fmt.Sprintf("%d-%d-%d-%d.png", sIdx, bIdx, c1Idx, c2Idx)
-
-						// Check map (avoid os.Stat calls)
 						if existingFiles[fName] {
 							atomic.AddInt64(&processedCount, 1)
 							continue
@@ -147,10 +134,10 @@ func main() {
 
 						jobs <- RenderJob{
 							Filename: fName,
-							Palette:  sharedPalette,
-							Symbol:   symbol.OriginalIcon,
-							Border:   border.OriginalIcon,
-							Outline:  border.OriginalOutline,
+							Palette:  smartPalette,
+							Symbol:   symbol.ScaledIcon,
+							Border:   border.ScaledIcon,
+							Outline:  border.ScaledOutline,
 						}
 					}
 				}
@@ -160,58 +147,49 @@ func main() {
 	}()
 
 	wg.Wait()
-	fmt.Printf("\n✨ Generation complete! Saved to: %s\n", OutputPath)
+	fmt.Printf("\n✨ Generation complete!\n")
 }
 
 func processJob(j RenderJob) {
-	// Get two buffers from the pool: one for the final image, one for the mask (scratch)
 	dst := rgbaPool.Get().(*image.RGBA)
-	scratch := rgbaPool.Get().(*image.RGBA)
-
 	defer rgbaPool.Put(dst)
-	defer rgbaPool.Put(scratch)
 
-	// Clear dst
 	draw.Draw(dst, dst.Bounds(), image.Transparent, image.Point{}, draw.Src)
 
-	// Colors are taken from the palette (Palette[1]=C1, Palette[2]=C2)
-	c1 := j.Palette[1]
-	c2 := j.Palette[2]
-
-	// Layer 1: Border Base (Scale 1.0, Tint C2)
+	// Layer order: Border -> Symbol -> Outline
 	if j.Border != nil {
-		drawLayer(dst, scratch, j.Border, c2, 1.0)
+		drawTinted(dst, j.Border, j.Palette[5]) // Use 100% C2
 	}
-	// Layer 2: Symbol (Scale 0.7, Tint C1)
 	if j.Symbol != nil {
-		drawLayer(dst, scratch, j.Symbol, c1, 0.7)
+		drawTinted(dst, j.Symbol, j.Palette[1]) // Use 100% C1
 	}
-	// Layer 3: Outline (Scale 1.0, Tint C1)
 	if j.Outline != nil {
-		drawLayer(dst, scratch, j.Outline, c1, 1.0)
+		drawTinted(dst, j.Outline, j.Palette[1])
 	}
 
 	savePNG(j.Filename, dst, j.Palette)
 }
 
-func drawLayer(dst, scratch, src *image.RGBA, tint color.Color, scale float64) {
-	sb := src.Bounds()
-	w, h := int(float64(sb.Dx())*scale), int(float64(sb.Dy())*scale)
-	if w <= 0 || h <= 0 {
-		return
+func drawTinted(dst *image.RGBA, mask *image.Alpha, tint color.Color) {
+	draw.DrawMask(dst, dst.Bounds(), image.NewUniform(tint), image.Point{}, mask, image.Point{}, draw.Over)
+}
+
+func createSmartPalette(c1, c2 color.RGBA) color.Palette {
+	pal := make(color.Palette, 0, 9)
+	pal = append(pal, color.RGBA{0, 0, 0, 0}) // Index 0: Transparent
+
+	// 4 steps of alpha for each color to handle anti-aliasing
+	alphas := []uint8{255, 170, 85, 20}
+
+	// C1 indices: 1, 2, 3, 4
+	for _, a := range alphas {
+		pal = append(pal, color.RGBA{c1.R, c1.G, c1.B, a})
 	}
-
-	ox, oy := (OutputSize-w)/2, (OutputSize-h)/2
-	rect := image.Rect(ox, oy, ox+w, oy+h)
-
-	// Clear scratch (important because it comes from the pool)
-	draw.Draw(scratch, rect, image.Transparent, image.Point{}, draw.Src)
-
-	// Scale: source -> scratch
-	xdraw.NearestNeighbor.Scale(scratch, rect, src, sb, xdraw.Over, nil)
-
-	// Apply tint: draw tint onto dst using scratch as mask
-	draw.DrawMask(dst, rect, image.NewUniform(tint), image.Point{}, scratch, rect.Min, draw.Over)
+	// C2 indices: 5, 6, 7, 8
+	for _, a := range alphas {
+		pal = append(pal, color.RGBA{c2.R, c2.G, c2.B, a})
+	}
+	return pal
 }
 
 func savePNG(filename string, img *image.RGBA, pal color.Palette) {
@@ -221,7 +199,6 @@ func savePNG(filename string, img *image.RGBA, pal color.Palette) {
 	palImg.Palette = pal
 	draw.Draw(palImg, palImg.Bounds(), img, image.Point{}, draw.Src)
 
-	// Determine output path. In single-run mode we may use "badge.png" as a simple filename.
 	fullPath := filepath.Join(OutputPath, filename)
 	if filename == "badge.png" {
 		fullPath = "badge.png"
@@ -234,86 +211,44 @@ func savePNG(filename string, img *image.RGBA, pal color.Palette) {
 	defer f.Close()
 
 	enc := png.Encoder{CompressionLevel: png.BestCompression}
-	_ = enc.Encode(f, palImg)
+	enc.Encode(f, palImg)
 }
 
-// --- Helpers ---
-
-func scanOutputDirectory() {
-	existingFiles = make(map[string]bool)
-	entries, err := os.ReadDir(OutputPath)
-	if err != nil {
-		return // Directory may not exist; that's OK
-	}
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".png") {
-			existingFiles[e.Name()] = true
-		}
-	}
-}
-
-func runSingleMode(arg string) {
-	parts := strings.Split(arg, "_")
-	if len(parts) != 4 {
-		fmt.Println("Usage: program.exe SIdx_BIdx_C1Idx_C2Idx")
-		return
-	}
-	s, _ := strconv.Atoi(parts[0])
-	b, _ := strconv.Atoi(parts[1])
-	c1Idx, _ := strconv.Atoi(parts[2])
-	c2Idx, _ := strconv.Atoi(parts[3])
-
-	c1 := getColor(c1Idx)
-	c2 := getColor(c2Idx)
-
-	pal := color.Palette{color.RGBA{0, 0, 0, 0}, c1, c2}
-
-	// Find requested icons
-	var sym, border *BadgeIconData
-	// Simple lookup (could be optimized; not critical for single run)
-	if s < len(badgeIcons) {
-		sym = &badgeIcons[s]
-	}
-	if b < len(badgeIcons) {
-		border = &badgeIcons[b]
-	}
-
-	if sym == nil || border == nil {
-		fmt.Println("Invalid icon indices")
-		return
-	}
-
-	job := RenderJob{
-		Filename: "badge.png",
-		Palette:  pal,
-		Symbol:   sym.OriginalIcon,
-		Border:   border.OriginalIcon,
-		Outline:  border.OriginalOutline,
-	}
-
-	// Run directly
-	processJob(job)
-	fmt.Println("✅ Generated badge.png")
-}
-
-func buildFileCaseMap() {
-	fileCaseMap = make(map[string]string)
-	_ = fs.WalkDir(assetsFS, ".", func(path string, d fs.DirEntry, err error) error {
-		if err == nil && !d.IsDir() {
-			fileCaseMap[strings.ToLower(filepath.Base(path))] = path
-		}
+func preProcessImage(src *image.RGBA, scale float64, scratch *image.RGBA) *image.Alpha {
+	if src == nil {
 		return nil
-	})
+	}
+
+	sb := src.Bounds()
+	w, h := int(float64(sb.Dx())*scale), int(float64(sb.Dy())*scale)
+	ox, oy := (OutputSize-w)/2, (OutputSize-h)/2
+	rect := image.Rect(ox, oy, ox+w, oy+h)
+
+	draw.Draw(scratch, scratch.Bounds(), image.Transparent, image.Point{}, draw.Src)
+	xdraw.CatmullRom.Scale(scratch, rect, src, sb, xdraw.Over, nil)
+
+	alpha := image.NewAlpha(image.Rect(0, 0, OutputSize, OutputSize))
+
+	for y := range OutputSize {
+		dstOffset := y * alpha.Stride
+		srcOffset := y * scratch.Stride
+
+		for x := range OutputSize {
+			a := scratch.Pix[srcOffset+x*4+3]
+			alpha.Pix[dstOffset+x] = a
+		}
+	}
+	return alpha
 }
 
 func loadIcons() error {
-	f1, err := assetsFS.Open("assets/csv/badge_colors.csv")
+	fColor, err := assetsFS.Open("assets/csv/badge_colors.csv")
 	if err != nil {
 		return err
 	}
-	defer f1.Close()
+	defer fColor.Close()
 
-	r1, _ := csv.NewReader(f1).ReadAll()
+	r1, _ := csv.NewReader(fColor).ReadAll()
 	for i := 1; i < len(r1); i++ {
 		r, _ := strconv.Atoi(r1[i][1])
 		g, _ := strconv.Atoi(r1[i][2])
@@ -327,19 +262,29 @@ func loadIcons() error {
 		}
 	}
 
-	f2, err := assetsFS.Open("assets/csv/badge_icons.csv")
+	fIcon, err := assetsFS.Open("assets/csv/badge_icons.csv")
 	if err != nil {
 		return err
 	}
-	defer f2.Close()
+	defer fIcon.Close()
 
-	r2, _ := csv.NewReader(f2).ReadAll()
+	r2, _ := csv.NewReader(fIcon).ReadAll()
+	loadScratch := image.NewRGBA(image.Rect(0, 0, OutputSize, OutputSize))
+
 	for i := 1; i < len(r2); i++ {
 		l, _ := strconv.Atoi(r2[i][3])
+		scale := 1.0
+		if l == 0 {
+			scale = 0.7
+		}
+
+		rawIcon := loadRawImage(r2[i][1])
+		rawOutline := loadRawImage(r2[i][2])
+
 		badgeIcons = append(badgeIcons, BadgeIconData{
-			Layer:           l,
-			OriginalIcon:    loadRawImage(r2[i][1]),
-			OriginalOutline: loadRawImage(r2[i][2]),
+			Layer:         l,
+			ScaledIcon:    preProcessImage(rawIcon, scale, loadScratch),
+			ScaledOutline: preProcessImage(rawOutline, scale, loadScratch),
 		})
 	}
 	return nil
@@ -379,6 +324,28 @@ func getColor(idx int) color.RGBA {
 	return color.RGBA{uint8(c.R), uint8(c.G), uint8(c.B), 255}
 }
 
+func scanOutputDirectory() {
+	existingFiles = make(map[string]bool)
+	entries, err := os.ReadDir(OutputPath)
+	if err == nil {
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".png") {
+				existingFiles[e.Name()] = true
+			}
+		}
+	}
+}
+
+func buildFileCaseMap() {
+	fileCaseMap = make(map[string]string)
+	fs.WalkDir(assetsFS, ".", func(path string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			fileCaseMap[strings.ToLower(filepath.Base(path))] = path
+		}
+		return nil
+	})
+}
+
 func calculateTotal() int {
 	syms, shapes := 0, 0
 	for _, icon := range badgeIcons {
@@ -394,4 +361,28 @@ func calculateTotal() int {
 func printProgress(curr, total int64) {
 	percent := float64(curr) / float64(total) * 100
 	fmt.Printf("\033[2K\r[Progress] %.2f%% (%d/%d)", percent, curr, total)
+}
+
+func runSingleMode(arg string) {
+	parts := strings.Split(arg, "_")
+	if len(parts) != 4 {
+		return
+	}
+	s, _ := strconv.Atoi(parts[0])
+	b, _ := strconv.Atoi(parts[1])
+	c1Idx, _ := strconv.Atoi(parts[2])
+	c2Idx, _ := strconv.Atoi(parts[3])
+
+	c1, c2 := getColor(c1Idx), getColor(c2Idx)
+	pal := createSmartPalette(c1, c2)
+
+	job := RenderJob{
+		Filename: "badge.png",
+		Palette:  pal,
+		Symbol:   badgeIcons[s].ScaledIcon,
+		Border:   badgeIcons[b].ScaledIcon,
+		Outline:  badgeIcons[b].ScaledOutline,
+	}
+	processJob(job)
+	fmt.Println("✅ Generated badge.png")
 }
