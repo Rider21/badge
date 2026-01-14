@@ -1,10 +1,6 @@
 name: Compress Images
 
 on:
-  push:
-    branches: ["data"]
-    paths:
-      - "images/*.png"
   workflow_dispatch:
 
 jobs:
@@ -23,7 +19,8 @@ jobs:
       - name: Install Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y pngquant oxipng parallel bc
+          sudo apt-get install -y pngquant parallel bc
+          cargo install oxipng --locked
 
       - name: Compress and Calculate
         id: compression
