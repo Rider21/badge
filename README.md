@@ -6,7 +6,7 @@ A high-performance Go application that generates custom badges by combining icon
 ## Features
 
 - **Parallel Processing**: Utilizes all available CPU cores for rendering and encoding
-- **Memory Efficient**: Object pooling for RGBA buffers and palette-based PNG compression
+- **Memory Efficient**: Object pooling for RGBA buffers minimizes GC pressure
 - **Batch Generation**: Creates all valid combinations of icons and colors
 - **Single Mode**: Generate individual badges on demand
 

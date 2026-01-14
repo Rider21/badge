@@ -5,7 +5,7 @@ on:
 
 permissions:
   contents: write
-  
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -22,7 +22,7 @@ jobs:
 
       - name: Run program
         run: ./app
-  
+
       - name: Commit and push to data branch
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

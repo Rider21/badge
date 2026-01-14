@@ -1,0 +1,64 @@
+name: Compress Images
+
+on:
+  push:
+    branches: ["data"]
+    paths:
+      - "images/*.png"
+  workflow_dispatch:
+
+jobs:
+  optimize:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: data
+          fetch-depth: 0
+
+      - name: Install Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pngquant oxipng parallel bc
+
+      - name: Compress and Calculate
+        id: compression
+        run: |
+          SIZE_BEFORE=$(du -sb images | cut -f1)
+
+          find images -name "*.png" | parallel --bar "pngquant --quality=80-100 --speed 1 --ext .png --force {} || true"
+          oxipng -o 2 -r --strip safe images/
+
+          SIZE_AFTER=$(du -sb images | cut -f1)
+          DIFF=$((SIZE_BEFORE - SIZE_AFTER))
+
+          if [ $DIFF -le 0 ]; then DIFF=0; fi
+
+          if [ $DIFF -ge 1048576 ]; then
+            SAVED_HUMAN="$(echo "scale=2; $DIFF/1048576" | bc) MB"
+          else
+            SAVED_HUMAN="$(echo "$DIFF/1024" | bc) KB"
+          fi
+
+          echo "saved_info=$SAVED_HUMAN" >> $GITHUB_OUTPUT
+          echo "diff=$DIFF" >> $GITHUB_OUTPUT
+
+      - name: Manual Git Commit and Push
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          SAVED="${{ steps.compression.outputs.saved_info }}"
+          DIFF_RAW="${{ steps.compression.outputs.diff }}"
+
+          if [ "$DIFF_RAW" -gt 0 ]; then
+            git add images/*.png
+            git commit -m "⚡ Optimized: saved $SAVED"
+            git push origin data
+          else
+            echo "No changes"
+          fi

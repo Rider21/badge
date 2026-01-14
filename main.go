@@ -39,10 +39,11 @@ type BadgeIconData struct {
 
 type RenderJob struct {
 	Filename string
-	Palette  color.Palette
 	Symbol   *image.Alpha
 	Border   *image.Alpha
 	Outline  *image.Alpha
+	FgColor  color.RGBA
+	BgColor  color.RGBA
 }
 
 var (
@@ -51,8 +52,7 @@ var (
 	layer0ColorIndices []int
 	layer1ColorIndices []int
 
-	rgbaPool    sync.Pool
-	palettePool sync.Pool
+	rgbaPool sync.Pool
 
 	fileCaseMap   map[string]string
 	existingFiles map[string]bool
@@ -64,35 +64,34 @@ func init() {
 			return image.NewRGBA(image.Rect(0, 0, OutputSize, OutputSize))
 		},
 	}
-	palettePool = sync.Pool{
-		New: func() interface{} {
-			return image.NewPaletted(image.Rect(0, 0, OutputSize, OutputSize), nil)
-		},
-	}
 }
 
 func main() {
-	fmt.Println("🚀 Starting build")
+	fmt.Println("Starting build...")
 	buildFileCaseMap()
 
+	// Load all badge icons and colors
 	if err := loadIcons(); err != nil {
 		log.Fatalf("Critical error: %v", err)
 	}
 
+	// Single badge generation mode
 	if len(os.Args) > 1 {
 		runSingleMode(os.Args[1])
 		return
 	}
 
+	// Batch generation mode
 	os.MkdirAll(OutputPath, 0755)
 	scanOutputDirectory()
 
 	total := calculateTotal()
-	fmt.Printf("✅ Resources loaded. Total combinations: %d\n", total)
+	fmt.Printf("Total combinations: %d\n", total)
 	if total == 0 {
 		return
 	}
 
+	// Initialize worker pool
 	numWorkers := runtime.NumCPU()
 	jobs := make(chan RenderJob, numWorkers*2)
 	var processedCount int64
@@ -116,8 +115,6 @@ func main() {
 			for _, c2Idx := range layer1ColorIndices {
 				c2 := getColor(c2Idx)
 
-				smartPalette := createSmartPalette(c1, c2)
-
 				for sIdx, symbol := range badgeIcons {
 					if symbol.Layer != 0 {
 						continue
@@ -134,10 +131,11 @@ func main() {
 
 						jobs <- RenderJob{
 							Filename: fName,
-							Palette:  smartPalette,
 							Symbol:   symbol.ScaledIcon,
 							Border:   border.ScaledIcon,
 							Outline:  border.ScaledOutline,
+							FgColor:  c1,
+							BgColor:  c2,
 						}
 					}
 				}
@@ -147,58 +145,37 @@ func main() {
 	}()
 
 	wg.Wait()
-	fmt.Printf("\n✨ Generation complete!\n")
+	fmt.Printf("\nGeneration complete!\n")
 }
 
 func processJob(j RenderJob) {
-	dst := rgbaPool.Get().(*image.RGBA)
-	defer rgbaPool.Put(dst)
+	// Get fresh RGBA buffer from pool
+	src := rgbaPool.Get().(*image.RGBA)
+	defer rgbaPool.Put(src)
 
-	draw.Draw(dst, dst.Bounds(), image.Transparent, image.Point{}, draw.Src)
+	// Clear buffer
+	draw.Draw(src, src.Bounds(), image.Transparent, image.Point{}, draw.Src)
 
-	// Layer order: Border -> Symbol -> Outline
+	// Layer components: border (background), symbol, outline
 	if j.Border != nil {
-		drawTinted(dst, j.Border, j.Palette[5]) // Use 100% C2
+		drawTinted(src, j.Border, j.BgColor)
 	}
 	if j.Symbol != nil {
-		drawTinted(dst, j.Symbol, j.Palette[1]) // Use 100% C1
+		drawTinted(src, j.Symbol, j.FgColor)
 	}
 	if j.Outline != nil {
-		drawTinted(dst, j.Outline, j.Palette[1])
+		drawTinted(src, j.Outline, j.FgColor)
 	}
 
-	savePNG(j.Filename, dst, j.Palette)
+	savePNG(j.Filename, src)
 }
 
 func drawTinted(dst *image.RGBA, mask *image.Alpha, tint color.Color) {
+	// Composite tinted mask onto destination using alpha masking
 	draw.DrawMask(dst, dst.Bounds(), image.NewUniform(tint), image.Point{}, mask, image.Point{}, draw.Over)
 }
 
-func createSmartPalette(c1, c2 color.RGBA) color.Palette {
-	pal := make(color.Palette, 0, 9)
-	pal = append(pal, color.RGBA{0, 0, 0, 0}) // Index 0: Transparent
-
-	// 4 steps of alpha for each color to handle anti-aliasing
-	alphas := []uint8{255, 170, 85, 20}
-
-	// C1 indices: 1, 2, 3, 4
-	for _, a := range alphas {
-		pal = append(pal, color.RGBA{c1.R, c1.G, c1.B, a})
-	}
-	// C2 indices: 5, 6, 7, 8
-	for _, a := range alphas {
-		pal = append(pal, color.RGBA{c2.R, c2.G, c2.B, a})
-	}
-	return pal
-}
-
-func savePNG(filename string, img *image.RGBA, pal color.Palette) {
-	palImg := palettePool.Get().(*image.Paletted)
-	defer palettePool.Put(palImg)
-
-	palImg.Palette = pal
-	draw.Draw(palImg, palImg.Bounds(), img, image.Point{}, draw.Src)
-
+func savePNG(filename string, img *image.RGBA) {
 	fullPath := filepath.Join(OutputPath, filename)
 	if filename == "badge.png" {
 		fullPath = "badge.png"
@@ -211,7 +188,7 @@ func savePNG(filename string, img *image.RGBA, pal color.Palette) {
 	defer f.Close()
 
 	enc := png.Encoder{CompressionLevel: png.BestCompression}
-	enc.Encode(f, palImg)
+	enc.Encode(f, img)
 }
 
 func preProcessImage(src *image.RGBA, scale float64, scratch *image.RGBA) *image.Alpha {
@@ -219,23 +196,34 @@ func preProcessImage(src *image.RGBA, scale float64, scratch *image.RGBA) *image
 		return nil
 	}
 
+	// Calculate scaled dimensions
 	sb := src.Bounds()
-	w, h := int(float64(sb.Dx())*scale), int(float64(sb.Dy())*scale)
-	ox, oy := (OutputSize-w)/2, (OutputSize-h)/2
+	w := int(float64(sb.Dx()) * scale)
+	h := int(float64(sb.Dy()) * scale)
+
+	// Ensure even dimensions for proper centering
+	if w%2 != 0 {
+		w++
+	}
+	if h%2 != 0 {
+		h++
+	}
+
+	// Center scaled image in output canvas
+	ox := (OutputSize - w) / 2
+	oy := (OutputSize - h) / 2
 	rect := image.Rect(ox, oy, ox+w, oy+h)
 
 	draw.Draw(scratch, scratch.Bounds(), image.Transparent, image.Point{}, draw.Src)
 	xdraw.CatmullRom.Scale(scratch, rect, src, sb, xdraw.Over, nil)
 
+	// Extract alpha channel from scaled scratch buffer
 	alpha := image.NewAlpha(image.Rect(0, 0, OutputSize, OutputSize))
-
 	for y := range OutputSize {
 		dstOffset := y * alpha.Stride
 		srcOffset := y * scratch.Stride
-
 		for x := range OutputSize {
-			a := scratch.Pix[srcOffset+x*4+3]
-			alpha.Pix[dstOffset+x] = a
+			alpha.Pix[dstOffset+x] = scratch.Pix[srcOffset+x*4+3]
 		}
 	}
 	return alpha
@@ -374,15 +362,15 @@ func runSingleMode(arg string) {
 	c2Idx, _ := strconv.Atoi(parts[3])
 
 	c1, c2 := getColor(c1Idx), getColor(c2Idx)
-	pal := createSmartPalette(c1, c2)
 
 	job := RenderJob{
 		Filename: "badge.png",
-		Palette:  pal,
 		Symbol:   badgeIcons[s].ScaledIcon,
 		Border:   badgeIcons[b].ScaledIcon,
 		Outline:  badgeIcons[b].ScaledOutline,
+		FgColor:  c1,
+		BgColor:  c2,
 	}
 	processJob(job)
-	fmt.Println("✅ Generated badge.png")
+	fmt.Println("Generated badge.png")
 }
